@@ -403,13 +403,18 @@ func reactToMessage(m *discordgo.MessageCreate, matches [][]string) {
 // this is lazy and only finds the first shortdef entry
 func defineWord(m *discordgo.MessageCreate) {
 	resultsString := ""
+	phrase := ""
 	msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is word
-	if len(msg) != 2 {
+	if len(msg) < 2 {
 		return
 	}
 
-	word := msg[1]
-	response, err := http.Get(dictionaryUri + word + "?" + dictionaryKey)
+	if len(msg) == 2 {
+		phrase = msg[1]
+	} else {
+		phrase = strings.Join(msg[1:], " ")
+	}
+	response, err := http.Get(dictionaryUri + phrase + "?key=" + dictionaryKey)
 	if err != nil {
 		return
 	}
