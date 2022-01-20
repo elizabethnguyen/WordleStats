@@ -37,17 +37,21 @@ const (
 	None
 )
 
+const dictionaryUri string = "https://dictionaryapi.com/api/v3/references/collegiate/json/"
+
 var (
 	token                 string
 	mongoClient           *mongo.Client
 	bot                   *discordgo.Session
 	playerStatsCollection *mongo.Collection
 	scoreMappings         map[string]int
+	dictionaryKey         string
 )
 
 type Configuration struct {
-	MongoURI     string
-	DiscordToken string
+	MongoURI         string
+	DiscordToken     string
+	DictionaryAPIKey string
 }
 
 type PlayerStats struct {
@@ -92,6 +96,8 @@ func init() {
 	}
 
 	bot = dg
+
+	dictionaryKey = configuration.DictionaryAPIKey
 
 	// number of turns: X, 1, 2, 3, 4, 5, 6
 	scoreMappings = map[string]int{"X": 0, "1": 6, "2": 5, "3": 4, "4": 3, "5": 2, "6": 1}
@@ -403,7 +409,7 @@ func defineWord(m *discordgo.MessageCreate) {
 	}
 
 	word := msg[1]
-	response, err := http.Get(fmt.Sprintf("https://dictionaryapi.com/api/v3/references/collegiate/json/%s?key=f5072c68-e2df-43e0-8a72-90bb79b21ee7", word))
+	response, err := http.Get(dictionaryUri + word + "?" + dictionaryKey)
 	if err != nil {
 		return
 	}
@@ -418,10 +424,12 @@ func defineWord(m *discordgo.MessageCreate) {
 
 	if len(responseObject) == 0 {
 		bot.ChannelMessageSend(m.Message.ChannelID, "Did not find a valid word!")
+		return
 	}
 
 	if len(responseObject[0].Definitions) == 0 {
 		bot.ChannelMessageSend(m.Message.ChannelID, "Did not find a valid word!")
+		return
 	}
 
 	shortdefs := responseObject[0].Definitions
