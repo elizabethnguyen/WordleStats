@@ -204,9 +204,10 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		defineWord(m)
 	case Archive:
 		adminArchiveLeaderboard(m)
-	// case Champ:
-	// 	//
-	// case History:
+	case Champ:
+		printChamp(m)
+	case History:
+		printHistoricalScoreboard(m)
 	default:
 		// do nothing
 	}
@@ -253,15 +254,15 @@ func matchRegex(m *discordgo.MessageCreate) WordleBotAction {
 		return Archive
 	}
 
-	// champMatch, _ := regexp.MatchString("^!champ$", m.Content)
-	// if champMatch {
-	// 	return Champ
-	// }
+	champMatch, _ := regexp.MatchString("^!champ", m.Content)
+	if champMatch {
+		return Champ
+	}
 
-	// historyMatch, _ := regexp.MatchString("^!history\\s\\w+$", m.Content)
-	// if historyMatch {
-	// 	return History
-	// }
+	historyMatch, _ := regexp.MatchString("^!history", m.Content)
+	if historyMatch {
+		return History
+	}
 
 	return None
 }
@@ -405,9 +406,8 @@ func generateLeaderboardString(stats []PlayerStats) string {
 	if resultsString == "" {
 		resultsString = "No Wordles have been submitted!"
 	}
-	finalString := "⭐**Wordle Leaderboard**⭐\n" + resultsString
 
-	return finalString
+	return resultsString
 }
 
 // guild specific
@@ -424,7 +424,7 @@ func printLeaderboard(m *discordgo.MessageCreate) {
 	}
 
 	result := getSortedLeaderboard(guildId)
-	finalString := generateLeaderboardString(result)
+	finalString := "⭐**Wordle Leaderboard**⭐\n" + generateLeaderboardString(result)
 	bot.ChannelMessageSend(m.Message.ChannelID, finalString)
 }
 
@@ -570,6 +570,18 @@ func getArchive(a string, guildID string) Archives {
 	return archive
 }
 
+// guild specific
+func getLatestArchive(guildID string) Archives {
+	archive := Archives{}
+	filter := bson.D{{Key: "guild_id", Value: guildID}}
+	opts := &options.FindOneOptions{}
+	opts.SetSort(bson.D{{Key: "$natural", Value: -1}})
+	result := archivesCollection.FindOne(context.TODO(), filter, opts)
+	result.Decode(&archive)
+
+	return archive
+}
+
 func archiveLeaderboard(archiveName string, m *discordgo.MessageCreate) {
 	scoreboard := getSortedLeaderboard(m.GuildID)
 	scoreboardString := generateLeaderboardString(scoreboard)
@@ -585,4 +597,66 @@ func archiveLeaderboard(archiveName string, m *discordgo.MessageCreate) {
 	if err != nil {
 		fmt.Println("Error while saving to db: ", err)
 	}
+}
+
+// guild specific
+func printChamp(m *discordgo.MessageCreate) {
+	guildId := m.GuildID
+
+	msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is archiveId - if not specified, will retrieve latest archive
+	if len(msg) > 2 {
+		return
+	}
+
+	if len(msg) == 2 {
+		archiveId := msg[1]
+		a := getArchive(archiveId, guildId)
+		if a.ArchiveID == "" {
+			bot.ChannelMessageSend(m.Message.ChannelID, "Archive not found!")
+			return
+		}
+
+		finalString := fmt.Sprintf("The champion of the %s leaderboard is 👑 **%s** 👑 with a score of **%d**! 🎉", archiveId, a.WinningUsername, a.WinningScore)
+		bot.ChannelMessageSend(m.Message.ChannelID, finalString)
+		return
+	}
+
+	a := getLatestArchive(guildId)
+	if a.ArchiveID == "" {
+		bot.ChannelMessageSend(m.Message.ChannelID, "There are no archives for this server!")
+		return
+	}
+
+	finalString := fmt.Sprintf("The most recent champion is 👑 **%s** 👑 with a score of **%d**! 🎉", a.WinningUsername, a.WinningScore)
+	bot.ChannelMessageSend(m.Message.ChannelID, finalString)
+}
+
+// guild specific
+func printHistoricalScoreboard(m *discordgo.MessageCreate) {
+	guildId := m.GuildID
+
+	msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is archiveId - if not specified, will retrieve latest archive
+	if len(msg) > 2 {
+		return
+	}
+
+	if len(msg) == 2 {
+		archiveId := msg[1]
+		a := getArchive(archiveId, guildId)
+		if a.ArchiveID == "" {
+			bot.ChannelMessageSend(m.Message.ChannelID, "Archive not found!")
+			return
+		}
+
+		bot.ChannelMessageSend(m.Message.ChannelID, "⭐ **Archived Wordle Leaderboard - "+a.ArchiveID+"** ⭐\n"+a.Scoreboard)
+		return
+	}
+
+	a := getLatestArchive(guildId)
+	if a.ArchiveID == "" {
+		bot.ChannelMessageSend(m.Message.ChannelID, "There are no archives for this server!")
+		return
+	}
+
+	bot.ChannelMessageSend(m.Message.ChannelID, "⭐ **Archived Wordle Leaderboard - "+a.ArchiveID+"** ⭐\n"+a.Scoreboard)
 }
