@@ -34,6 +34,9 @@ const (
 	WipeLeaderboard
 	Scoring
 	Define
+	Archive
+	Champ
+	History
 	None
 )
 
@@ -44,6 +47,7 @@ var (
 	mongoClient           *mongo.Client
 	bot                   *discordgo.Session
 	playerStatsCollection *mongo.Collection
+	archivesCollection    *mongo.Collection
 	scoreMappings         map[string]int
 	dictionaryKey         string
 )
@@ -61,6 +65,16 @@ type PlayerStats struct {
 	TotalScore  int                 `bson:"total_score"`
 	LastPuzzle  string              `bson:"last_puzzle"`
 	LastUpdated primitive.Timestamp `bson:"timestamp"`
+}
+
+type Archives struct {
+	ArchiveID       string              `bson:"archive_id"`
+	WinningUserID   string              `bson:"winning_user_id"`
+	WinningUsername string              `bson:"winning_username"`
+	GuildID         string              `bson:"guild_id"`
+	WinningScore    int                 `bson:"winning_score"`
+	Scoreboard      string              `bson:"scoreboard"`
+	Created         primitive.Timestamp `bson:"created"`
 }
 
 type DictionaryResponse struct {
@@ -114,6 +128,7 @@ func initMongoDB(mongoURI string) (*mongo.Client, error) {
 	}
 
 	playerStatsCollection = client.Database("WordleStats").Collection("PlayerStats")
+	archivesCollection = client.Database("WordleStats").Collection("Archives")
 
 	// Check the connection
 	err = client.Ping(context.TODO(), nil)
@@ -187,13 +202,18 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		printHelp(m)
 	case Define:
 		defineWord(m)
+	case Archive:
+		adminArchiveLeaderboard(m)
+	// case Champ:
+	// 	//
+	// case History:
 	default:
 		// do nothing
 	}
 }
 
 func matchRegex(m *discordgo.MessageCreate) WordleBotAction {
-	leaderboardMatch, _ := regexp.MatchString("^!leaderboard$", m.Content)
+	leaderboardMatch, _ := regexp.MatchString("^!leaderboard", m.Content)
 	if leaderboardMatch {
 		return Leaderboard
 	}
@@ -228,6 +248,21 @@ func matchRegex(m *discordgo.MessageCreate) WordleBotAction {
 		return Define
 	}
 
+	archiveMatch, _ := regexp.MatchString("^!archive\\s\\w+", m.Content)
+	if archiveMatch {
+		return Archive
+	}
+
+	// champMatch, _ := regexp.MatchString("^!champ$", m.Content)
+	// if champMatch {
+	// 	return Champ
+	// }
+
+	// historyMatch, _ := regexp.MatchString("^!history\\s\\w+$", m.Content)
+	// if historyMatch {
+	// 	return History
+	// }
+
 	return None
 }
 
@@ -241,7 +276,7 @@ func handleWordlePost(m *discordgo.MessageCreate) {
 		// exit early if its not a valid wordle result >:(
 		if !((matches[0][1] >= "1" && matches[0][1] <= "6") || matches[0][1] == "X") {
 			bot.ChannelMessageSend(m.Message.ChannelID, "Invalid submission! r u tryin' 2 cheat? 👀")
-			reactToMessage(m, nil)
+			reactToScore(m, nil)
 			return
 		}
 
@@ -255,7 +290,7 @@ func handleWordlePost(m *discordgo.MessageCreate) {
 				stats.LastPuzzle = puzzleNumber
 			} else {
 				bot.ChannelMessageSend(m.Message.ChannelID, "Invalid submission! r u tryin' 2 cheat? 👀")
-				reactToMessage(m, nil)
+				reactToScore(m, nil)
 				return
 			}
 		} else {
@@ -263,7 +298,7 @@ func handleWordlePost(m *discordgo.MessageCreate) {
 		}
 
 		submitPuzzle(m, stats, score, puzzleNumber)
-		reactToMessage(m, matches)
+		reactToScore(m, matches)
 	}
 }
 
@@ -337,9 +372,8 @@ Contact skonoms#8552 for any questions, bug reports, or requests.`
 	bot.ChannelMessageSend(m.Message.ChannelID, msg)
 }
 
-// guild specific
-func printLeaderboard(m *discordgo.MessageCreate) {
-	cur, err := playerStatsCollection.Find(context.TODO(), bson.D{{Key: "guild_id", Value: m.GuildID}})
+func getSortedLeaderboard(guildId string) []PlayerStats {
+	cur, err := playerStatsCollection.Find(context.TODO(), bson.D{{Key: "guild_id", Value: guildId}})
 	if err != nil {
 		fmt.Println("Error while getting collection: ", err)
 	}
@@ -354,10 +388,14 @@ func printLeaderboard(m *discordgo.MessageCreate) {
 		return result[i].TotalScore > result[j].TotalScore
 	})
 
+	return result
+}
+
+func generateLeaderboardString(stats []PlayerStats) string {
 	resultsString := ""
-	for i, r := range result {
+	for i, r := range stats {
 		scoreString := r.Username + ": " + fmt.Sprint(r.TotalScore)
-		if i < len(result)-1 {
+		if i < len(stats)-1 {
 			scoreString += "\n"
 		}
 
@@ -368,6 +406,25 @@ func printLeaderboard(m *discordgo.MessageCreate) {
 		resultsString = "No Wordles have been submitted!"
 	}
 	finalString := "⭐**Wordle Leaderboard**⭐\n" + resultsString
+
+	return finalString
+}
+
+// guild specific
+func printLeaderboard(m *discordgo.MessageCreate) {
+	guildId := m.GuildID
+
+	msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is guildId (optional)
+	if len(msg) > 2 {
+		return
+	}
+
+	if len(msg) == 2 {
+		guildId = msg[1]
+	}
+
+	result := getSortedLeaderboard(guildId)
+	finalString := generateLeaderboardString(result)
 	bot.ChannelMessageSend(m.Message.ChannelID, finalString)
 }
 
@@ -383,7 +440,7 @@ X/6: 0 points
 	bot.ChannelMessageSend(m.Message.ChannelID, msg)
 }
 
-func reactToMessage(m *discordgo.MessageCreate, matches [][]string) {
+func reactToScore(m *discordgo.MessageCreate, matches [][]string) {
 	if matches == nil {
 		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "🤔")
 		return
@@ -454,7 +511,7 @@ func defineWord(m *discordgo.MessageCreate) {
 func adminWipeLeaderboard(m *discordgo.MessageCreate) {
 	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
 		playerStatsCollection.DeleteMany(context.TODO(), bson.D{{Key: "guild_id", Value: m.GuildID}})
-		bot.ChannelMessageSend(m.Message.ChannelID, "The leaderboard has been wiped!")
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
 	}
 }
 
@@ -477,6 +534,55 @@ func adminUpdateScore(m *discordgo.MessageCreate) {
 
 		user := getPlayerStatsByUsername(username, m.GuildID)
 		updateScore(user, score)
-		bot.ChannelMessageSend(m.Message.ChannelID, "User score updated!")
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
+	}
+}
+
+// guild specific
+func adminArchiveLeaderboard(m *discordgo.MessageCreate) {
+	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
+		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is archive name
+
+		if len(msg) != 2 {
+			return
+		}
+
+		archiveName := msg[1]
+
+		existingArchive := getArchive(archiveName, m.GuildID)
+		if existingArchive.ArchiveID != "" {
+			bot.ChannelMessageSend(m.Message.ChannelID, "Archive already exists!")
+			return
+		}
+
+		archiveLeaderboard(archiveName, m)
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
+	}
+}
+
+// guild specific
+func getArchive(a string, guildID string) Archives {
+	archive := Archives{}
+	filter := bson.D{{Key: "archive_id", Value: a}, {Key: "guild_id", Value: guildID}}
+	result := archivesCollection.FindOne(context.TODO(), filter, &options.FindOneOptions{})
+	result.Decode(&archive)
+
+	return archive
+}
+
+func archiveLeaderboard(archiveName string, m *discordgo.MessageCreate) {
+	scoreboard := getSortedLeaderboard(m.GuildID)
+	scoreboardString := generateLeaderboardString(scoreboard)
+
+	a := Archives{archiveName, scoreboard[0].UserID, scoreboard[0].Username, m.GuildID, scoreboard[0].TotalScore, scoreboardString, primitive.Timestamp{T: uint32(time.Now().Unix())}}
+
+	aDoc, err := bson.Marshal(a)
+	if err != nil {
+		fmt.Println("Error while marshalling: ", err)
+	}
+
+	_, err = archivesCollection.InsertOne(context.TODO(), aDoc)
+	if err != nil {
+		fmt.Println("Error while saving to db: ", err)
 	}
 }
