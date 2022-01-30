@@ -32,7 +32,6 @@ const (
 	Help
 	UpdateScore
 	WipeLeaderboard
-	Scoring
 	Define
 	Archive
 	Champ
@@ -41,6 +40,8 @@ const (
 	SetScoring
 	GetSettings
 	ResetSettings
+	AddPermissions
+	RemovePermissions
 	None
 )
 
@@ -71,6 +72,7 @@ var (
 	playerStatsCollection   *mongo.Collection
 	archivesCollection      *mongo.Collection
 	guildSettingsCollection *mongo.Collection
+	permissionsCollection   *mongo.Collection
 	defaultScoreMappings    map[string]int
 	dictionaryKey           string
 )
@@ -112,6 +114,11 @@ type GuildSettings struct {
 	ScoreSix    int                 `bson:"score_six"`
 	ScoreX      int                 `bson:"score_x"`
 	LastUpdated primitive.Timestamp `bson:"last_updated"`
+}
+
+type Permissions struct {
+	UserID  string `bson:"user_id"`
+	GuildID string `bson:"guild_id"`
 }
 
 type DictionaryResponse struct {
@@ -168,6 +175,7 @@ func initMongoDB(mongoURI string) (*mongo.Client, error) {
 	playerStatsCollection = client.Database("WordleStats").Collection("PlayerStats")
 	archivesCollection = client.Database("WordleStats").Collection("Archives")
 	guildSettingsCollection = client.Database("WordleStats").Collection("GuildSettings")
+	permissionsCollection = client.Database("WordleStats").Collection("Permissions")
 
 	// Check the connection
 	err = client.Ping(context.TODO(), nil)
@@ -227,8 +235,6 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	action := matchRegex(m)
 
 	switch action {
-	case Scoring:
-		printScoring(m)
 	case Leaderboard:
 		printLeaderboard(m)
 	case UpdateScore:
@@ -255,6 +261,10 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		printGuildSettings(m)
 	case ResetSettings:
 		adminResetGuildSettings(m)
+	case AddPermissions:
+		adminAddPermissions(m)
+	case RemovePermissions:
+		adminRemovePermissions(m)
 	default:
 		// do nothing
 	}
@@ -274,11 +284,6 @@ func matchRegex(m *discordgo.MessageCreate) WordleBotAction {
 	wipeLeaderboardMatch, _ := regexp.MatchString("^!wipeLeaderboard$", m.Content)
 	if wipeLeaderboardMatch {
 		return WipeLeaderboard
-	}
-
-	scoringMatch, _ := regexp.MatchString("^!scoring$", m.Content)
-	if scoringMatch {
-		return Scoring
 	}
 
 	wordlePostMatch, _ := regexp.MatchString("^Wordle [0-9]+ ([0-9]|X)\\/[0-9]", m.Content)
@@ -329,6 +334,16 @@ func matchRegex(m *discordgo.MessageCreate) WordleBotAction {
 	resetSettingsMatch, _ := regexp.MatchString("^!resetSettings$", m.Content)
 	if resetSettingsMatch {
 		return ResetSettings
+	}
+
+	addPermissionsMatch, _ := regexp.MatchString("^!addPermissions ", m.Content)
+	if addPermissionsMatch {
+		return AddPermissions
+	}
+
+	removePermissionsMatch, _ := regexp.MatchString("^!removePermissions ", m.Content)
+	if removePermissionsMatch {
+		return RemovePermissions
 	}
 
 	return None
@@ -469,10 +484,23 @@ func updateScore(stats PlayerStats, score int) {
 func printHelp(m *discordgo.MessageCreate) {
 	msg := `**How to use WordleStats**
 * **!leaderboard**: prints the current scores
-* **!scoring**: prints score breakdown
 * **!define [word]**: calls the Merriam-Webster API to define a word. Only picks the first definition available.
-* **!updateScore [user] [value]**: _admin only_. Updates the score of an existing user on the leaderboard.
-* **!wipe**: _admin only_. Wipes the leaderboard for the server.
+* **!history [archiveName]**: look at a leaderboard snapshot. If no name is specified, will retrieve the most recent archive.
+* **!champ [archiveName]**: outputs the top score + player for a specific snapshot. If none is specified, will retrieve the top player from the most recent archive.
+* **!getSettings**: outputs the difficulty rule and scoring system for the server.
+* **!help**: prints this message.
+
+**Admin-Only**
+* **!updateScore [user] [value]**: updates the score of an existing user on the leaderboard.
+* **!wipe**: wipes the leaderboard for the server.
+* **!archive [archiveName]**: saves a snapshot of the current leaderboard to a named archive.
+* **!resetSettings**: resets the difficulty and scoriing system to default.
+* **!setDifficulty [ANY/HARD/EASY]**: rule enforcement for the type of submissions that WordleStats will recognize.
+* **!setScoring [1] [2] [3] [4] [5] [6] [X]**: sets scoring system; must have all fields specified (negative values accepted)
+
+**skonoms-Only**
+* **!addPermissions [userId] [guildId]**: gives specified user admin permissions for the specified server
+* **!removePermissions [userId] [guildId]**: removes specified user admin permissions for the specified server
 
 Paste your Wordle stats into any channel in the server for WordleStats to pick it up. If WordleStats reacts to your message, your results have been recorded!
 
@@ -543,18 +571,6 @@ func printLeaderboard(m *discordgo.MessageCreate) {
 	bot.ChannelMessageSend(m.Message.ChannelID, finalString)
 }
 
-func printScoring(m *discordgo.MessageCreate) {
-	msg := `**Scoring System**
-X/6: 0 points
-1/6: 6 points
-2/6: 5 points
-3/6: 4 points
-4/6: 3 points
-5/6: 2 points
-6/6: 1 point`
-	bot.ChannelMessageSend(m.Message.ChannelID, msg)
-}
-
 func reactToScore(m *discordgo.MessageCreate, matches [][]string) {
 	if matches == nil {
 		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "🤔")
@@ -620,59 +636,6 @@ func defineWord(m *discordgo.MessageCreate) {
 	}
 
 	bot.ChannelMessageSend(m.Message.ChannelID, resultsString)
-}
-
-// guild specific
-func adminWipeLeaderboard(m *discordgo.MessageCreate) {
-	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
-		playerStatsCollection.DeleteMany(context.TODO(), bson.D{{Key: "guild_id", Value: m.GuildID}})
-		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
-	}
-}
-
-// guild specific
-func adminUpdateScore(m *discordgo.MessageCreate) {
-	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
-		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is name, 2 is score
-
-		if len(msg) != 3 {
-			return
-		}
-
-		username := msg[1]
-		strScore := msg[2]
-
-		score, err := strconv.Atoi(strScore)
-		if err != nil {
-			return
-		}
-
-		user := getPlayerStatsByUsername(username, m.GuildID)
-		updateScore(user, score)
-		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
-	}
-}
-
-// guild specific
-func adminArchiveLeaderboard(m *discordgo.MessageCreate) {
-	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
-		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is archive name
-
-		if len(msg) != 2 {
-			return
-		}
-
-		archiveName := msg[1]
-
-		existingArchive := getArchive(archiveName, m.GuildID)
-		if existingArchive.ArchiveID != "" {
-			bot.ChannelMessageSend(m.Message.ChannelID, "Archive already exists!")
-			return
-		}
-
-		archiveLeaderboard(archiveName, m)
-		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
-	}
 }
 
 // guild specific
@@ -784,28 +747,6 @@ func printHistoricalScoreboard(m *discordgo.MessageCreate) {
 	bot.ChannelMessageSend(m.Message.ChannelID, headerString+a.Scoreboard)
 }
 
-// guild specific
-func adminSetServerDifficulty(m *discordgo.MessageCreate) {
-	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
-		guildId := m.GuildID
-
-		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is difficulty - valid values are ANY, EASY, HARD
-		if len(msg) > 2 {
-			return
-		}
-
-		difficulty := msg[1]
-
-		if difficulty != ANY && difficulty != EASY && difficulty != HARD {
-			bot.ChannelMessageSend(m.Message.ChannelID, "Invalid difficulty! Supported values: [ANY, EASY, HARD]")
-			return
-		}
-
-		setServerDifficulty(guildId, difficulty)
-		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
-	}
-}
-
 func setServerDifficulty(guildId string, difficulty string) {
 	settings := GuildSettings{
 		GuildID:     guildId,
@@ -845,7 +786,9 @@ func setServerDifficulty(guildId string, difficulty string) {
 
 // guild specific
 func adminSetServerScoring(m *discordgo.MessageCreate) {
-	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
+	perms := getPermissionsForUserAndGuild(m.Author.ID, m.GuildID)
+
+	if perms.UserID != "" || m.Author.ID == "235580807098400771" { // only skonoms has permissions
 		guildId := m.GuildID
 
 		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1-8 are scores
@@ -866,6 +809,8 @@ func adminSetServerScoring(m *discordgo.MessageCreate) {
 
 		setServerScoring(guildId, scoring)
 		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
+	} else {
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "❌")
 	}
 }
 
@@ -935,13 +880,174 @@ X/6: %d`,
 		settings.ScoreSix, settings.ScoreX)
 }
 
+func addPermissions(userId string, guildId string) {
+	perms := Permissions{UserID: userId, GuildID: guildId}
+	filter := bson.D{{Key: "user_id", Value: userId}, {Key: "guild_id", Value: guildId}}
+	opts := options.Update().SetUpsert(true)
+
+	updateDoc := bson.M{
+		"$set": perms,
+	}
+	_, err := permissionsCollection.UpdateOne(context.TODO(), filter, updateDoc, &options.UpdateOptions{}, opts)
+	if err != nil {
+		fmt.Println("Error while saving to db: ", err)
+	}
+}
+
+func removePermissions(userId string, guildId string) {
+	filter := bson.D{{Key: "user_id", Value: userId}, {Key: "guild_id", Value: guildId}}
+	opts := options.Delete()
+
+	_, err := permissionsCollection.DeleteOne(context.TODO(), filter, &options.DeleteOptions{}, opts)
+	if err != nil {
+		fmt.Println("Error while deleting from db: ", err)
+	}
+}
+
 // guild specific
-func adminResetGuildSettings(m *discordgo.MessageCreate) {
+func getPermissionsForUserAndGuild(userId string, guildId string) Permissions {
+	perms := Permissions{}
+	filter := bson.D{{Key: "user_id", Value: userId}, {Key: "guild_id", Value: guildId}}
+	result := permissionsCollection.FindOne(context.TODO(), filter, &options.FindOneOptions{})
+	result.Decode(&perms)
+
+	return perms
+}
+
+// guild specific, only skonoms has permission
+func adminRemovePermissions(m *discordgo.MessageCreate) {
 	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
+		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is userId, 2 is guildId
+		if len(msg) != 3 {
+			return
+		}
+
+		userId := msg[1]
+		guildId := msg[2]
+
+		removePermissions(userId, guildId)
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
+	}
+}
+
+// guild specific, multiple admins allowed
+func adminArchiveLeaderboard(m *discordgo.MessageCreate) {
+	perms := getPermissionsForUserAndGuild(m.Author.ID, m.GuildID)
+
+	if perms.UserID != "" || m.Author.ID == "235580807098400771" { // skonoms always has permissions
+		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is archive name
+
+		if len(msg) != 2 {
+			return
+		}
+
+		archiveName := msg[1]
+
+		existingArchive := getArchive(archiveName, m.GuildID)
+		if existingArchive.ArchiveID != "" {
+			bot.ChannelMessageSend(m.Message.ChannelID, "Archive already exists!")
+			return
+		}
+
+		archiveLeaderboard(archiveName, m)
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
+	} else {
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "❌")
+	}
+}
+
+// guild specific, multiple admins allowed
+func adminResetGuildSettings(m *discordgo.MessageCreate) {
+	perms := getPermissionsForUserAndGuild(m.Author.ID, m.GuildID)
+
+	if perms.UserID != "" || m.Author.ID == "235580807098400771" { // skonoms always has permissions
 		guildId := m.GuildID
 
 		setServerScoring(guildId, defaultScores)
 		setServerDifficulty(guildId, defaultDifficulty)
 		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
+	} else {
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "❌")
+	}
+}
+
+// guild specific, only skonoms has permission
+func adminAddPermissions(m *discordgo.MessageCreate) {
+	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
+		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is userId, 2 is guildId
+		if len(msg) != 3 {
+			return
+		}
+
+		userId := msg[1]
+		guildId := msg[2]
+
+		addPermissions(userId, guildId)
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
+	}
+}
+
+// guild specific, multiple admins allowed
+func adminWipeLeaderboard(m *discordgo.MessageCreate) {
+	perms := getPermissionsForUserAndGuild(m.Author.ID, m.GuildID)
+
+	if perms.UserID != "" || m.Author.ID == "235580807098400771" { // skonoms always has permissions
+		playerStatsCollection.DeleteMany(context.TODO(), bson.D{{Key: "guild_id", Value: m.GuildID}})
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
+	} else {
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "❌")
+	}
+}
+
+// guild specific, multiple admins allowed
+func adminUpdateScore(m *discordgo.MessageCreate) {
+	perms := getPermissionsForUserAndGuild(m.Author.ID, m.GuildID)
+
+	if perms.UserID != "" || m.Author.ID == "235580807098400771" { // skonoms always has permissions
+		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is name, 2 is score
+
+		if len(msg) != 3 {
+			return
+		}
+
+		username := msg[1]
+		strScore := msg[2]
+
+		score, err := strconv.Atoi(strScore)
+		if err != nil {
+			return
+		}
+
+		user := getPlayerStatsByUsername(username, m.GuildID)
+		updateScore(user, score)
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
+	} else {
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "❌")
+	}
+}
+
+// guild specific, multiple admins allowed
+func adminSetServerDifficulty(m *discordgo.MessageCreate) {
+	perms := getPermissionsForUserAndGuild(m.Author.ID, m.GuildID)
+
+	if perms.UserID != "" || m.Author.ID == "235580807098400771" { // skonoms always has permissions
+		guildId := m.GuildID
+
+		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is difficulty - valid values are ANY, EASY, HARD
+		if len(msg) > 2 {
+			return
+		}
+
+		difficulty := msg[1]
+
+		if difficulty != ANY && difficulty != EASY && difficulty != HARD {
+			bot.ChannelMessageSend(m.Message.ChannelID, "Invalid difficulty! Supported values: [ANY, EASY, HARD]")
+			return
+		}
+
+		setServerDifficulty(guildId, difficulty)
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
+	} else {
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "❌")
 	}
 }
