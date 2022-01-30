@@ -38,6 +38,9 @@ const (
 	Champ
 	History
 	SetDifficulty
+	SetScoring
+	GetSettings
+	ResetSettings
 	None
 )
 
@@ -48,6 +51,18 @@ const (
 )
 
 const dictionaryUri string = "https://dictionaryapi.com/api/v3/references/collegiate/json/"
+const defaultGuildSettings string = `Difficulty: ANY
+1/6: 6
+2/6: 5
+3/6: 4
+4/6: 3
+5/6: 2
+6/6: 1
+X/6: 0`
+
+const defaultDifficulty string = ANY
+
+var defaultScores []int
 
 var (
 	token                   string
@@ -56,7 +71,7 @@ var (
 	playerStatsCollection   *mongo.Collection
 	archivesCollection      *mongo.Collection
 	guildSettingsCollection *mongo.Collection
-	scoreMappings           map[string]int
+	defaultScoreMappings    map[string]int
 	dictionaryKey           string
 )
 
@@ -89,6 +104,13 @@ type Archives struct {
 type GuildSettings struct {
 	GuildID     string              `bson:"guild_id"`
 	Difficulty  string              `bson:"difficulty"`
+	ScoreOne    int                 `bson:"score_one"`
+	ScoreTwo    int                 `bson:"score_two"`
+	ScoreThree  int                 `bson:"score_three"`
+	ScoreFour   int                 `bson:"score_four"`
+	ScoreFive   int                 `bson:"score_five"`
+	ScoreSix    int                 `bson:"score_six"`
+	ScoreX      int                 `bson:"score_x"`
 	LastUpdated primitive.Timestamp `bson:"last_updated"`
 }
 
@@ -129,7 +151,8 @@ func init() {
 	dictionaryKey = configuration.DictionaryAPIKey
 
 	// number of turns: X, 1, 2, 3, 4, 5, 6
-	scoreMappings = map[string]int{"X": 0, "1": 6, "2": 5, "3": 4, "4": 3, "5": 2, "6": 1}
+	defaultScoreMappings = map[string]int{"X": 0, "1": 6, "2": 5, "3": 4, "4": 3, "5": 2, "6": 1}
+	defaultScores = []int{6, 5, 4, 3, 2, 1, 0}
 }
 
 func initMongoDB(mongoURI string) (*mongo.Client, error) {
@@ -226,6 +249,12 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		printHistoricalScoreboard(m)
 	case SetDifficulty:
 		adminSetServerDifficulty(m)
+	case SetScoring:
+		adminSetServerScoring(m)
+	case GetSettings:
+		printGuildSettings(m)
+	case ResetSettings:
+		adminResetGuildSettings(m)
 	default:
 		// do nothing
 	}
@@ -287,18 +316,35 @@ func matchRegex(m *discordgo.MessageCreate) WordleBotAction {
 		return SetDifficulty
 	}
 
+	setScoringMatch, _ := regexp.MatchString("^!setScoring -?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+$", m.Content)
+	if setScoringMatch {
+		return SetScoring
+	}
+
+	getSettingsMatch, _ := regexp.MatchString("^!getSettings", m.Content)
+	if getSettingsMatch {
+		return GetSettings
+	}
+
+	resetSettingsMatch, _ := regexp.MatchString("^!resetSettings$", m.Content)
+	if resetSettingsMatch {
+		return ResetSettings
+	}
+
 	return None
 }
 
 func handleWordlePost(m *discordgo.MessageCreate) {
 	var matches [][]string
 	difficulty := ANY
+	scoreMappings := defaultScoreMappings
 	scoreMatchEasy := `([0-9]|X)\/[0-9]`
 	scoreMatchHard := `([0-9]|X)\/[0-9]\*`
 
 	settings := getGuildSettings(m.GuildID)
 	if settings.GuildID != "" {
 		difficulty = settings.Difficulty
+		scoreMappings = map[string]int{"X": settings.ScoreX, "1": settings.ScoreOne, "2": settings.ScoreTwo, "3": settings.ScoreThree, "4": settings.ScoreFour, "5": settings.ScoreFive, "6": settings.ScoreSix}
 	}
 
 	easyScore := regexp.MustCompile(scoreMatchEasy)
@@ -756,19 +802,146 @@ func adminSetServerDifficulty(m *discordgo.MessageCreate) {
 		}
 
 		setServerDifficulty(guildId, difficulty)
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
 	}
 }
 
 func setServerDifficulty(guildId string, difficulty string) {
+	settings := GuildSettings{
+		GuildID:     guildId,
+		Difficulty:  difficulty,
+		ScoreOne:    defaultScoreMappings["1"],
+		ScoreTwo:    defaultScoreMappings["2"],
+		ScoreThree:  defaultScoreMappings["3"],
+		ScoreFour:   defaultScoreMappings["4"],
+		ScoreFive:   defaultScoreMappings["5"],
+		ScoreSix:    defaultScoreMappings["6"],
+		ScoreX:      defaultScoreMappings["X"],
+		LastUpdated: primitive.Timestamp{T: uint32(time.Now().Unix())}}
+
+	existingSettings := getGuildSettings(guildId)
+
+	if existingSettings.GuildID != "" {
+		settings.ScoreOne = existingSettings.ScoreOne
+		settings.ScoreTwo = existingSettings.ScoreTwo
+		settings.ScoreThree = existingSettings.ScoreThree
+		settings.ScoreFour = existingSettings.ScoreFour
+		settings.ScoreFive = existingSettings.ScoreFive
+		settings.ScoreSix = existingSettings.ScoreSix
+		settings.ScoreX = existingSettings.ScoreX
+	}
+
 	filter := bson.D{{Key: "guild_id", Value: guildId}}
 	opts := options.Update().SetUpsert(true)
 
-	settings := GuildSettings{guildId, difficulty, primitive.Timestamp{T: uint32(time.Now().Unix())}}
 	updateDoc := bson.M{
 		"$set": settings,
 	}
 	_, err := guildSettingsCollection.UpdateOne(context.TODO(), filter, updateDoc, &options.UpdateOptions{}, opts)
 	if err != nil {
 		fmt.Println("Error while saving to db: ", err)
+	}
+}
+
+// guild specific
+func adminSetServerScoring(m *discordgo.MessageCreate) {
+	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
+		guildId := m.GuildID
+
+		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1-8 are scores
+		if len(msg) != 8 {
+			return
+		}
+
+		strSlice := msg[1:]
+		var scoring = []int{}
+
+		for _, i := range strSlice {
+			j, err := strconv.Atoi(i)
+			if err != nil {
+				return
+			}
+			scoring = append(scoring, j)
+		}
+
+		setServerScoring(guildId, scoring)
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
+	}
+}
+
+func setServerScoring(guildId string, scoring []int) {
+	settings := GuildSettings{
+		GuildID:     guildId,
+		Difficulty:  ANY,
+		ScoreOne:    scoring[0],
+		ScoreTwo:    scoring[1],
+		ScoreThree:  scoring[2],
+		ScoreFour:   scoring[3],
+		ScoreFive:   scoring[4],
+		ScoreSix:    scoring[5],
+		ScoreX:      scoring[6],
+		LastUpdated: primitive.Timestamp{T: uint32(time.Now().Unix())}}
+
+	existingSettings := getGuildSettings(guildId)
+
+	if existingSettings.GuildID != "" {
+		settings.Difficulty = existingSettings.Difficulty
+	}
+
+	filter := bson.D{{Key: "guild_id", Value: guildId}}
+	opts := options.Update().SetUpsert(true)
+
+	updateDoc := bson.M{
+		"$set": settings,
+	}
+	_, err := guildSettingsCollection.UpdateOne(context.TODO(), filter, updateDoc, &options.UpdateOptions{}, opts)
+	if err != nil {
+		fmt.Println("Error while saving to db: ", err)
+	}
+}
+
+// guild specific
+func printGuildSettings(m *discordgo.MessageCreate) {
+	guildId := m.GuildID
+	msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is guildId - if not specified, prints for current guild
+	if len(msg) > 2 {
+		return
+	}
+
+	if len(msg) == 2 {
+		guildId = msg[1]
+	}
+
+	settings := getGuildSettings(guildId)
+	if settings.GuildID == "" {
+		bot.ChannelMessageSend(m.Message.ChannelID, defaultGuildSettings)
+		return
+	}
+
+	bot.ChannelMessageSend(m.Message.ChannelID, formatGuildSettingsMessage(settings))
+}
+
+func formatGuildSettingsMessage(settings GuildSettings) string {
+	return fmt.Sprintf(`Difficulty: %s
+1/6: %d
+2/6: %d
+3/6: %d
+4/6: %d
+5/6: %d
+6/6: %d
+X/6: %d`,
+		settings.Difficulty, settings.ScoreOne, settings.ScoreTwo,
+		settings.ScoreThree, settings.ScoreFour, settings.ScoreFive,
+		settings.ScoreSix, settings.ScoreX)
+}
+
+// guild specific
+func adminResetGuildSettings(m *discordgo.MessageCreate) {
+	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
+		guildId := m.GuildID
+
+		setServerScoring(guildId, defaultScores)
+		setServerDifficulty(guildId, defaultDifficulty)
+		bot.MessageReactionAdd(m.Message.ChannelID, m.Message.ID, "✅")
 	}
 }
