@@ -37,19 +37,27 @@ const (
 	Archive
 	Champ
 	History
+	SetDifficulty
 	None
+)
+
+const (
+	ANY  string = "ANY"
+	HARD string = "HARD"
+	EASY string = "EASY"
 )
 
 const dictionaryUri string = "https://dictionaryapi.com/api/v3/references/collegiate/json/"
 
 var (
-	token                 string
-	mongoClient           *mongo.Client
-	bot                   *discordgo.Session
-	playerStatsCollection *mongo.Collection
-	archivesCollection    *mongo.Collection
-	scoreMappings         map[string]int
-	dictionaryKey         string
+	token                   string
+	mongoClient             *mongo.Client
+	bot                     *discordgo.Session
+	playerStatsCollection   *mongo.Collection
+	archivesCollection      *mongo.Collection
+	guildSettingsCollection *mongo.Collection
+	scoreMappings           map[string]int
+	dictionaryKey           string
 )
 
 type Configuration struct {
@@ -74,7 +82,14 @@ type Archives struct {
 	GuildID         string              `bson:"guild_id"`
 	WinningScore    int                 `bson:"winning_score"`
 	Scoreboard      string              `bson:"scoreboard"`
+	Difficulty      string              `bson:"difficulty"`
 	Created         primitive.Timestamp `bson:"created"`
+}
+
+type GuildSettings struct {
+	GuildID     string              `bson:"guild_id"`
+	Difficulty  string              `bson:"difficulty"`
+	LastUpdated primitive.Timestamp `bson:"last_updated"`
 }
 
 type DictionaryResponse struct {
@@ -129,6 +144,7 @@ func initMongoDB(mongoURI string) (*mongo.Client, error) {
 
 	playerStatsCollection = client.Database("WordleStats").Collection("PlayerStats")
 	archivesCollection = client.Database("WordleStats").Collection("Archives")
+	guildSettingsCollection = client.Database("WordleStats").Collection("GuildSettings")
 
 	// Check the connection
 	err = client.Ping(context.TODO(), nil)
@@ -208,6 +224,8 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		printChamp(m)
 	case History:
 		printHistoricalScoreboard(m)
+	case SetDifficulty:
+		adminSetServerDifficulty(m)
 	default:
 		// do nothing
 	}
@@ -264,43 +282,76 @@ func matchRegex(m *discordgo.MessageCreate) WordleBotAction {
 		return History
 	}
 
+	setDifficultyMatch, _ := regexp.MatchString("^!setDifficulty", m.Content)
+	if setDifficultyMatch {
+		return SetDifficulty
+	}
+
 	return None
 }
 
 func handleWordlePost(m *discordgo.MessageCreate) {
-	dailyScore := regexp.MustCompile(`([0-9]|X)\/[0-9]`)
-	matches := dailyScore.FindAllStringSubmatch(m.Content, 1)
-	if len(matches) > 0 {
-		wordleString := strings.Split(m.Content, " ")
-		puzzleNumber := wordleString[1]
+	var matches [][]string
+	difficulty := ANY
+	scoreMatchEasy := `([0-9]|X)\/[0-9]`
+	scoreMatchHard := `([0-9]|X)\/[0-9]\*`
 
-		// exit early if its not a valid wordle result >:(
-		if !((matches[0][1] >= "1" && matches[0][1] <= "6") || matches[0][1] == "X") {
+	settings := getGuildSettings(m.GuildID)
+	if settings.GuildID != "" {
+		difficulty = settings.Difficulty
+	}
+
+	easyScore := regexp.MustCompile(scoreMatchEasy)
+	hardScore := regexp.MustCompile(scoreMatchHard)
+	easyMatches := easyScore.FindAllStringSubmatch(m.Content, 1)
+	hardMatches := hardScore.FindAllStringSubmatch(m.Content, 1)
+
+	// regex is being funky so hardmode submissions will have matches on both
+	if len(easyMatches) > 0 && len(hardMatches) == 0 {
+		if difficulty == HARD {
+			bot.ChannelMessageSend(m.Message.ChannelID, "Invalid submission! Server settings are set for hard mode only.")
+			return
+		}
+		matches = easyMatches
+	} else if len(hardMatches) > 0 {
+		if difficulty == EASY {
+			bot.ChannelMessageSend(m.Message.ChannelID, "Invalid submission! Server settings are set for easy mode only.")
+			return
+		}
+		matches = hardMatches
+	} else {
+		return
+	}
+
+	wordleString := strings.Split(m.Content, " ")
+	puzzleNumber := wordleString[1]
+
+	// exit early if its not a valid wordle result >:(
+	if !((matches[0][1] >= "1" && matches[0][1] <= "6") || matches[0][1] == "X") {
+		bot.ChannelMessageSend(m.Message.ChannelID, "Invalid submission! r u tryin' 2 cheat? 👀")
+		reactToScore(m, nil)
+		return
+	}
+
+	stats := getPlayerStatsByAuthorAndGuild(m)
+	score := 0
+
+	if stats.UserID != "" {
+		// puzzle has to be larger than the last puzzle done (no repeats)
+		if puzzleNumber > stats.LastPuzzle {
+			score = stats.TotalScore + scoreMappings[matches[0][1]]
+			stats.LastPuzzle = puzzleNumber
+		} else {
 			bot.ChannelMessageSend(m.Message.ChannelID, "Invalid submission! r u tryin' 2 cheat? 👀")
 			reactToScore(m, nil)
 			return
 		}
-
-		stats := getPlayerStatsByAuthorAndGuild(m)
-		score := 0
-
-		if stats.UserID != "" {
-			// puzzle has to be larger than the last puzzle done (no repeats)
-			if puzzleNumber > stats.LastPuzzle {
-				score = stats.TotalScore + scoreMappings[matches[0][1]]
-				stats.LastPuzzle = puzzleNumber
-			} else {
-				bot.ChannelMessageSend(m.Message.ChannelID, "Invalid submission! r u tryin' 2 cheat? 👀")
-				reactToScore(m, nil)
-				return
-			}
-		} else {
-			score = scoreMappings[matches[0][1]]
-		}
-
-		submitPuzzle(m, stats, score, puzzleNumber)
-		reactToScore(m, matches)
+	} else {
+		score = scoreMappings[matches[0][1]]
 	}
+
+	submitPuzzle(m, stats, score, puzzleNumber)
+	reactToScore(m, matches)
 }
 
 // guild specific
@@ -321,6 +372,16 @@ func getPlayerStatsByUsername(username string, guildID string) PlayerStats {
 	result.Decode(&stats)
 
 	return stats
+}
+
+// guild specific
+func getGuildSettings(guildID string) GuildSettings {
+	settings := GuildSettings{}
+	filter := bson.D{{Key: "guild_id", Value: guildID}}
+	result := guildSettingsCollection.FindOne(context.TODO(), filter, &options.FindOneOptions{})
+	result.Decode(&settings)
+
+	return settings
 }
 
 func submitPuzzle(m *discordgo.MessageCreate, stats PlayerStats, score int, puzzleNum string) {
@@ -412,7 +473,13 @@ func generateLeaderboardString(stats []PlayerStats) string {
 
 // guild specific
 func printLeaderboard(m *discordgo.MessageCreate) {
+	difficulty := ANY
 	guildId := m.GuildID
+
+	settings := getGuildSettings(guildId)
+	if settings.GuildID != "" {
+		difficulty = settings.Difficulty
+	}
 
 	msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is guildId (optional)
 	if len(msg) > 2 {
@@ -424,7 +491,9 @@ func printLeaderboard(m *discordgo.MessageCreate) {
 	}
 
 	result := getSortedLeaderboard(guildId)
-	finalString := "⭐**Wordle Leaderboard**⭐\n" + generateLeaderboardString(result)
+
+	headerString := "⭐**Current Wordle Leaderboard - difficulty: " + difficulty + "**⭐\n"
+	finalString := headerString + generateLeaderboardString(result)
 	bot.ChannelMessageSend(m.Message.ChannelID, finalString)
 }
 
@@ -583,10 +652,17 @@ func getLatestArchive(guildID string) Archives {
 }
 
 func archiveLeaderboard(archiveName string, m *discordgo.MessageCreate) {
+	difficulty := ANY
 	scoreboard := getSortedLeaderboard(m.GuildID)
 	scoreboardString := generateLeaderboardString(scoreboard)
 
-	a := Archives{archiveName, scoreboard[0].UserID, scoreboard[0].Username, m.GuildID, scoreboard[0].TotalScore, scoreboardString, primitive.Timestamp{T: uint32(time.Now().Unix())}}
+	settings := getGuildSettings(m.GuildID)
+
+	if settings.GuildID != "" {
+		difficulty = settings.Difficulty
+	}
+
+	a := Archives{archiveName, scoreboard[0].UserID, scoreboard[0].Username, m.GuildID, scoreboard[0].TotalScore, scoreboardString, difficulty, primitive.Timestamp{T: uint32(time.Now().Unix())}}
 
 	aDoc, err := bson.Marshal(a)
 	if err != nil {
@@ -634,7 +710,6 @@ func printChamp(m *discordgo.MessageCreate) {
 // guild specific
 func printHistoricalScoreboard(m *discordgo.MessageCreate) {
 	guildId := m.GuildID
-
 	msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is archiveId - if not specified, will retrieve latest archive
 	if len(msg) > 2 {
 		return
@@ -648,7 +723,8 @@ func printHistoricalScoreboard(m *discordgo.MessageCreate) {
 			return
 		}
 
-		bot.ChannelMessageSend(m.Message.ChannelID, "⭐ **Archived Wordle Leaderboard - "+a.ArchiveID+"** ⭐\n"+a.Scoreboard)
+		headerString := "⭐ **Archived Wordle Leaderboard - " + a.ArchiveID + ", difficulty: " + a.Difficulty + "** ⭐\n"
+		bot.ChannelMessageSend(m.Message.ChannelID, headerString+a.Scoreboard)
 		return
 	}
 
@@ -658,5 +734,41 @@ func printHistoricalScoreboard(m *discordgo.MessageCreate) {
 		return
 	}
 
-	bot.ChannelMessageSend(m.Message.ChannelID, "⭐ **Archived Wordle Leaderboard - "+a.ArchiveID+"** ⭐\n"+a.Scoreboard)
+	headerString := "⭐ **Archived Wordle Leaderboard - " + a.ArchiveID + ", difficulty: " + a.Difficulty + "** ⭐\n"
+	bot.ChannelMessageSend(m.Message.ChannelID, headerString+a.Scoreboard)
+}
+
+// guild specific
+func adminSetServerDifficulty(m *discordgo.MessageCreate) {
+	if m.Author.ID == "235580807098400771" { // only skonoms has permissions
+		guildId := m.GuildID
+
+		msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is difficulty - valid values are ANY, EASY, HARD
+		if len(msg) > 2 {
+			return
+		}
+
+		difficulty := msg[1]
+
+		if difficulty != ANY && difficulty != EASY && difficulty != HARD {
+			bot.ChannelMessageSend(m.Message.ChannelID, "Invalid difficulty! Supported values: [ANY, EASY, HARD]")
+			return
+		}
+
+		setServerDifficulty(guildId, difficulty)
+	}
+}
+
+func setServerDifficulty(guildId string, difficulty string) {
+	filter := bson.D{{Key: "guild_id", Value: guildId}}
+	opts := options.Update().SetUpsert(true)
+
+	settings := GuildSettings{guildId, difficulty, primitive.Timestamp{T: uint32(time.Now().Unix())}}
+	updateDoc := bson.M{
+		"$set": settings,
+	}
+	_, err := guildSettingsCollection.UpdateOne(context.TODO(), filter, updateDoc, &options.UpdateOptions{}, opts)
+	if err != nil {
+		fmt.Println("Error while saving to db: ", err)
+	}
 }
