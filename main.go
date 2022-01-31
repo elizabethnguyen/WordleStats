@@ -42,6 +42,7 @@ const (
 	ResetSettings
 	AddPermissions
 	RemovePermissions
+	GetDistribution
 	None
 )
 
@@ -66,15 +67,16 @@ const defaultDifficulty string = ANY
 var defaultScores []int
 
 var (
-	token                   string
-	mongoClient             *mongo.Client
-	bot                     *discordgo.Session
-	playerStatsCollection   *mongo.Collection
-	archivesCollection      *mongo.Collection
-	guildSettingsCollection *mongo.Collection
-	permissionsCollection   *mongo.Collection
-	defaultScoreMappings    map[string]int
-	dictionaryKey           string
+	token                          string
+	mongoClient                    *mongo.Client
+	bot                            *discordgo.Session
+	playerStatsCollection          *mongo.Collection
+	archivesCollection             *mongo.Collection
+	guildSettingsCollection        *mongo.Collection
+	permissionsCollection          *mongo.Collection
+	distributionArchivesCollection *mongo.Collection
+	defaultScoreMappings           map[string]int
+	dictionaryKey                  string
 )
 
 type Configuration struct {
@@ -89,6 +91,13 @@ type PlayerStats struct {
 	GuildID     string              `bson:"guild_id"`
 	TotalScore  int                 `bson:"total_score"`
 	LastPuzzle  string              `bson:"last_puzzle"`
+	TotalOne    int                 `bson:"total_one"`
+	TotalTwo    int                 `bson:"total_two"`
+	TotalThree  int                 `bson:"total_three"`
+	TotalFour   int                 `bson:"total_four"`
+	TotalFive   int                 `bson:"total_five"`
+	TotalSix    int                 `bson:"total_six"`
+	TotalX      int                 `bson:"total_x"`
 	LastUpdated primitive.Timestamp `bson:"timestamp"`
 }
 
@@ -101,6 +110,22 @@ type Archives struct {
 	Scoreboard      string              `bson:"scoreboard"`
 	Difficulty      string              `bson:"difficulty"`
 	Created         primitive.Timestamp `bson:"created"`
+}
+
+type PlayerDistributionArchive struct {
+	UserID     string              `bson:"user_id"`
+	Username   string              `bson:"username"`
+	GuildID    string              `bson:"guild_id"`
+	ArchiveID  string              `bson:"archive_id"`
+	TotalScore int                 `bson:"total_score"`
+	TotalOne   int                 `bson:"total_one"`
+	TotalTwo   int                 `bson:"total_two"`
+	TotalThree int                 `bson:"total_three"`
+	TotalFour  int                 `bson:"total_four"`
+	TotalFive  int                 `bson:"total_five"`
+	TotalSix   int                 `bson:"total_six"`
+	TotalX     int                 `bson:"total_x"`
+	Created    primitive.Timestamp `bson:"created"`
 }
 
 type GuildSettings struct {
@@ -176,6 +201,7 @@ func initMongoDB(mongoURI string) (*mongo.Client, error) {
 	archivesCollection = client.Database("WordleStats").Collection("Archives")
 	guildSettingsCollection = client.Database("WordleStats").Collection("GuildSettings")
 	permissionsCollection = client.Database("WordleStats").Collection("Permissions")
+	distributionArchivesCollection = client.Database("WordleStats").Collection("DistributionArchives")
 
 	// Check the connection
 	err = client.Ping(context.TODO(), nil)
@@ -265,6 +291,8 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		adminAddPermissions(m)
 	case RemovePermissions:
 		adminRemovePermissions(m)
+	case GetDistribution:
+		getDistribution(m)
 	default:
 		// do nothing
 	}
@@ -346,6 +374,11 @@ func matchRegex(m *discordgo.MessageCreate) WordleBotAction {
 		return RemovePermissions
 	}
 
+	getDistributionMatch, _ := regexp.MatchString("^!getDistribution ", m.Content)
+	if getDistributionMatch {
+		return GetDistribution
+	}
+
 	return None
 }
 
@@ -411,7 +444,7 @@ func handleWordlePost(m *discordgo.MessageCreate) {
 		score = scoreMappings[matches[0][1]]
 	}
 
-	submitPuzzle(m, stats, score, puzzleNumber)
+	submitPuzzle(m, stats, score, puzzleNumber, matches[0][1])
 	reactToScore(m, matches)
 }
 
@@ -445,7 +478,7 @@ func getGuildSettings(guildID string) GuildSettings {
 	return settings
 }
 
-func submitPuzzle(m *discordgo.MessageCreate, stats PlayerStats, score int, puzzleNum string) {
+func submitPuzzle(m *discordgo.MessageCreate, stats PlayerStats, score int, puzzleNum string, numAttempts string) {
 	filter := bson.D{{Key: "user_id", Value: m.Author.ID}, {Key: "guild_id", Value: m.GuildID}}
 	opts := options.Update().SetUpsert(true)
 
@@ -453,8 +486,32 @@ func submitPuzzle(m *discordgo.MessageCreate, stats PlayerStats, score int, puzz
 		stats.LastUpdated = primitive.Timestamp{T: uint32(time.Now().Unix())}
 		stats.TotalScore = score
 		stats.LastPuzzle = puzzleNum
+		switch numAttempts {
+		case "1":
+			stats.TotalOne += 1
+		case "2":
+			stats.TotalTwo += 1
+		case "3":
+			stats.TotalThree += 1
+		case "4":
+			stats.TotalFour += 1
+		case "5":
+			stats.TotalFive += 1
+		case "6":
+			stats.TotalSix += 1
+		case "X":
+			stats.TotalX += 1
+		default:
+			// do nothing
+		}
 	} else {
-		stats = PlayerStats{m.Author.ID, m.Author.Username, m.GuildID, score, puzzleNum, primitive.Timestamp{T: uint32(time.Now().Unix())}}
+		stats = PlayerStats{m.Author.ID,
+			m.Author.Username,
+			m.GuildID, score,
+			puzzleNum,
+			0, 0, 0, 0, 0, 0, 0, // score distributions
+			primitive.Timestamp{T: uint32(time.Now().Unix())},
+		}
 	}
 	updateDoc := bson.M{
 		"$set": stats,
@@ -488,11 +545,12 @@ func printHelp(m *discordgo.MessageCreate) {
 * **!history [archiveName]**: look at a leaderboard snapshot. If no name is specified, will retrieve the most recent archive.
 * **!champ [archiveName]**: outputs the top score + player for a specific snapshot. If none is specified, will retrieve the top player from the most recent archive.
 * **!getSettings**: outputs the difficulty rule and scoring system for the server.
+* **!getDistribution [username] [archiveName]**: archive name optional. Outputs the scoring distribution for current or archived leaderboard.
 * **!help**: prints this message.
 
 **Admin-Only**
 * **!updateScore [user] [value]**: updates the score of an existing user on the leaderboard.
-* **!wipe**: wipes the leaderboard for the server.
+* **!wipeLeaderboard**: wipes the leaderboard for the server.
 * **!archive [archiveName]**: saves a snapshot of the current leaderboard to a named archive.
 * **!resetSettings**: resets the difficulty and scoriing system to default.
 * **!setDifficulty [ANY/HARD/EASY]**: rule enforcement for the type of submissions that WordleStats will recognize.
@@ -527,6 +585,53 @@ func getSortedLeaderboard(guildId string) []PlayerStats {
 	return result
 }
 
+func getSingleDistributionStringByUsernameAndGuild(username string, guildId string, archiveName string) string {
+	finalString := ""
+	if archiveName == "" { // get current
+		stats := PlayerStats{}
+		filter := bson.D{{Key: "username", Value: username}, {Key: "guild_id", Value: guildId}}
+		result := playerStatsCollection.FindOne(context.TODO(), filter, &options.FindOneOptions{})
+		result.Decode(&stats)
+		if stats.UserID != "" {
+			finalString = convertToDistributionStringFromStats(stats)
+		}
+	} else {
+		dist := PlayerDistributionArchive{}
+		filter := bson.D{{Key: "username", Value: username}, {Key: "guild_id", Value: guildId}, {Key: "archive_id", Value: archiveName}}
+		result := distributionArchivesCollection.FindOne(context.TODO(), filter, &options.FindOneOptions{})
+		result.Decode(&dist)
+		if dist.UserID != "" {
+			finalString = convertToDistributionString(dist)
+		}
+	}
+
+	return finalString
+}
+
+func convertToDistributionStringFromStats(stats PlayerStats) string {
+	return fmt.Sprintf(`⭐**Distribution stats for current leaderboard**⭐
+	Score: %d
+	1/6: %d
+	2/6: %d
+	3/6: %d
+	4/6: %d
+	5/6: %d
+	6/6: %d
+	X/6: %d`, stats.TotalScore, stats.TotalOne, stats.TotalTwo, stats.TotalThree, stats.TotalFour, stats.TotalFive, stats.TotalSix, stats.TotalX)
+}
+
+func convertToDistributionString(dist PlayerDistributionArchive) string {
+	return fmt.Sprintf(`⭐**Distribution stats for leaderboard %s**⭐
+	Score: %d
+	1/6: %d
+	2/6: %d
+	3/6: %d
+	4/6: %d
+	5/6: %d
+	6/6: %d
+	X/6: %d`, dist.ArchiveID, dist.TotalScore, dist.TotalOne, dist.TotalTwo, dist.TotalThree, dist.TotalFour, dist.TotalFive, dist.TotalSix, dist.TotalX)
+}
+
 func generateLeaderboardString(stats []PlayerStats) string {
 	resultsString := ""
 	for i, r := range stats {
@@ -543,6 +648,31 @@ func generateLeaderboardString(stats []PlayerStats) string {
 	}
 
 	return resultsString
+}
+
+func generateDistributions(stats []PlayerStats, archive string) []PlayerDistributionArchive {
+	var distributions []PlayerDistributionArchive
+	for _, r := range stats {
+		d := PlayerDistributionArchive{
+			r.UserID,
+			r.Username,
+			r.GuildID,
+			archive,
+			r.TotalScore,
+			r.TotalOne,
+			r.TotalTwo,
+			r.TotalThree,
+			r.TotalFour,
+			r.TotalFive,
+			r.TotalSix,
+			r.TotalX,
+			primitive.Timestamp{T: uint32(time.Now().Unix())},
+		}
+
+		distributions = append(distributions, d)
+	}
+
+	return distributions
 }
 
 // guild specific
@@ -664,6 +794,7 @@ func archiveLeaderboard(archiveName string, m *discordgo.MessageCreate) {
 	difficulty := ANY
 	scoreboard := getSortedLeaderboard(m.GuildID)
 	scoreboardString := generateLeaderboardString(scoreboard)
+	distributions := generateDistributions(scoreboard, archiveName)
 
 	settings := getGuildSettings(m.GuildID)
 
@@ -672,13 +803,29 @@ func archiveLeaderboard(archiveName string, m *discordgo.MessageCreate) {
 	}
 
 	a := Archives{archiveName, scoreboard[0].UserID, scoreboard[0].Username, m.GuildID, scoreboard[0].TotalScore, scoreboardString, difficulty, primitive.Timestamp{T: uint32(time.Now().Unix())}}
+	saveArchive(a)
+	saveDistributions(distributions)
+}
 
+func saveArchive(a Archives) {
 	aDoc, err := bson.Marshal(a)
 	if err != nil {
 		fmt.Println("Error while marshalling: ", err)
 	}
 
 	_, err = archivesCollection.InsertOne(context.TODO(), aDoc)
+	if err != nil {
+		fmt.Println("Error while saving to db: ", err)
+	}
+}
+
+func saveDistributions(distributions []PlayerDistributionArchive) {
+	var iface []interface{}
+	for _, d := range distributions {
+		iface = append(iface, d)
+	}
+
+	_, err := distributionArchivesCollection.InsertMany(context.TODO(), iface)
 	if err != nil {
 		fmt.Println("Error while saving to db: ", err)
 	}
@@ -714,6 +861,30 @@ func printChamp(m *discordgo.MessageCreate) {
 
 	finalString := fmt.Sprintf("The most recent champion is 👑 **%s** 👑 with a score of **%d**! 🎉", a.WinningUsername, a.WinningScore)
 	bot.ChannelMessageSend(m.Message.ChannelID, finalString)
+}
+
+// guild specific, only supports usernames
+func getDistribution(m *discordgo.MessageCreate) {
+	msg := strings.Split(m.Message.Content, " ") // 0 is command, 1 is username, 2 is archiveId - if not specified, will retrieve current leaderboard
+	if len(msg) > 2 {
+		return
+	}
+
+	guildId := m.GuildID
+	username := msg[1]
+	archiveId := ""
+
+	if len(msg) == 3 {
+		archiveId = msg[2]
+	}
+
+	finalString := getSingleDistributionStringByUsernameAndGuild(username, guildId, archiveId)
+
+	if finalString == "" {
+		bot.ChannelMessageSend(m.Message.ChannelID, "Could not find any distribution data!")
+	} else {
+		bot.ChannelMessageSend(m.Message.ChannelID, finalString)
+	}
 }
 
 // guild specific
